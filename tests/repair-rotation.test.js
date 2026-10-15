@@ -1456,6 +1456,27 @@ test('negative control: a no-tools request can never emit tool_calls', async (t)
   assert.doesNotMatch(res.text, /notes\.txt/, 'no-tools mode must never leak the upstream tool payload');
 });
 
+test('second strict repair recovers a malformed first repair without exposing a 502 to Hermes', async (t) => {
+  const A = acct('A');
+  useAccounts(t, [A]);
+  const calls = installUpstream(t, {
+    completion: { A: [
+      () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+      () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+      () => sse(okSse(VALID_TOOL_CALL)),
+    ] },
+  });
+  const agent = 'repair-rotation-second-format-repair';
+  seedStickySession(t, agent, 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, agent, HISTORY_MESSAGES, { tools: TOOL_SCHEMA });
+
+  assert.equal(res.status, 200, 'a valid second repair must avoid the client-level 502/retry/fallback path');
+  assert.equal(res.json?.choices?.[0]?.message?.tool_calls?.[0]?.function?.name, 'read_file');
+  assert.equal(byPath(calls, COMPLETION, 'A').length, 3, 'one original call plus two bounded repair attempts');
+});
+
 test('unchanged normal successful repair still works on the sticky account', async (t) => {
   const A = acct('A');
   useAccounts(t, [A]);

@@ -4902,6 +4902,7 @@ const server = http.createServer(async (req, res) => {
             const shouldRepairNoTools = noToolsMode && !toolCall && !shouldRepairNative && looksLikeToolCallMarkup(fullContent);
             let repairRateLimitError = null;
             let repairUnavailable = false;
+            let repairAttempts = 0;
             if ((shouldRepairMarkup || shouldRepairCodeDump || shouldRepairNative || shouldRepairAbandoned || shouldRepairNoTools) && !clientGone && !deadlineHit()) {
                 const reason = shouldRepairNoTools
                     ? 'Model emitted tool markup but this request has no tools'
@@ -4922,26 +4923,53 @@ const server = http.createServer(async (req, res) => {
                             : (shouldRepairCodeDump
                                 ? '[STRICT INSTRUCTION] You pasted source code as plain text. This gateway cannot apply pasted files. Request exactly one tool to write or edit the file. Output ONLY strict JSON: {"tool_call":{"name":"<function>","arguments":{...}}}. Put file contents in the tool arguments, not in markdown fences.'
                                 : '[STRICT INSTRUCTION] You stopped after a tool result. Continue the task. Output exactly one gateway tool request as {"tool_call":{"name":"<function>","arguments":{...}}} or a complete final answer if the work is finished.')));
-                // The repair call is a recovery call: it keeps the full request context
-                // (system rules, transcript, pinned tool schema) and adds the repair
-                // directive, and it must be able to use the next ready login when the
-                // account that produced the malformed envelope is throttled (#21). Every
-                // account is tried at most once, a cooling account is never retried, and
-                // the loop stops on client disconnect or request deadline.
+                // The repair call keeps full request context and can fail over to a
+                // ready login if the current one is rate-limited.
                 const repairRecoveryPrompt = appendPromptInstruction(freshPrompt, strictPrompt);
                 let retryResult2 = null;
-                let repairAttempts = 0;
-                const repairMaxHops = Math.max(1, accounts.length);
+                let formatRepairRetries = 0;
+                // Preserve the existing account failover budget and add one extra
+                // format-repair attempt only for tool-enabled calls. This catches a
+                // malformed first repair before Hermes retries the entire request and
+                // falls back to a different provider. No-tools recovery remains unchanged.
+                const repairMaxHops = Math.max(1, accounts.length + (shouldRepairNoTools ? 0 : 1));
+                const secondStrictPrompt = appendPromptInstruction(
+                    repairRecoveryPrompt,
+                    shouldRepairNoTools
+                        ? '[STRICT INSTRUCTION] The previous retry still contained tool markup. Return only a plain-text answer; do not produce any tool call or markup.'
+                        : '[STRICT INSTRUCTION] Your last repair was still not a valid advertised tool request. Return exactly one JSON object with the exact tool name and arguments schema. Preserve every argument value; do not omit, shorten, or rewrite user data.'
+                );
+                const repairCandidateIsUsable = (result) => {
+                    const candidateText = result?.content ? sanitizeContent(result.content) : '';
+                    if (!candidateText.trim()) return false;
+                    if (shouldRepairNoTools) return !looksLikeToolCallMarkup(candidateText);
+                    const candidateCall = selectAgentToolCall(candidateText, allowedToolNames);
+                    const accepted = candidateCall && (
+                        (allowedToolNames.size > 0 && allowedToolNames.has(candidateCall.name))
+                        || (allowedToolNames.size === 0 && !isDeepSeekNativeTool(candidateCall.name))
+                    );
+                    return Boolean(accepted)
+                        || (!looksLikeToolCallMarkup(candidateText) && !looksLikeCodeDumpInsteadOfTool(candidateText));
+                };
                 for (let hop = 0; hop < repairMaxHops; hop++) {
                     if (clientGone || deadlineHit()) break;
                     repairAttempts++;
                     try {
                         const repairCall = await askDeepSeekStream(
-                            hop === 0 ? strictPrompt : repairRecoveryPrompt,
+                            hop === 0 ? strictPrompt : (shouldRepairNoTools ? repairRecoveryPrompt : secondStrictPrompt),
                             agentId, requestedModel, repairRecoveryPrompt, lockHolder, imageContext, webFlags
                         );
                         const repairRead = await readDeepSeekResponse(repairCall.resp.body, repairCall.account);
-                        if (!repairRead.rateLimited) { retryResult2 = repairRead; break; }
+                        if (!repairRead.rateLimited) {
+                            retryResult2 = repairRead;
+                            if (repairCandidateIsUsable(repairRead)) break;
+                            if (!shouldRepairNoTools && formatRepairRetries === 0 && repairAttempts < repairMaxHops) {
+                                formatRepairRetries++;
+                                console.log(`${agentTag} strict repair attempt ${repairAttempts}/${repairMaxHops} still malformed; making one further bounded format-repair attempt.`);
+                                continue;
+                            }
+                            break;
+                        }
                         repairRateLimitError = repairRead.rateLimitError || repairRateLimitError;
                         console.log(`${agentTag} strict repair rate-limited on account ${repairCall.account.id}; trying the next ready login.`);
                     } catch (e) {
@@ -5023,11 +5051,11 @@ const server = http.createServer(async (req, res) => {
                     return;
                 }
                 console.log(`${agentTag} Keeping chat ${session.id || '(none)'} after malformed tool markup.`);
-                logError(502, 'malformed_tool_call', 'DeepSeek returned malformed or native-only tool-call markup after one repair attempt');
+                logError(502, 'malformed_tool_call', `DeepSeek returned malformed or native-only tool-call markup after ${repairAttempts} repair attempt(s)`);
                 logRow.account = session.accountId;
                 res.writeHead(502, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: {
-                    message: 'DeepSeek returned malformed or native-only tool-call markup after one repair attempt',
+                    message: `DeepSeek returned malformed or native-only tool-call markup after ${repairAttempts} repair attempt(s)`,
                     type: 'malformed_tool_call',
                     agent: agentId,
                     failed_session_id: failure.failedSessionId,
