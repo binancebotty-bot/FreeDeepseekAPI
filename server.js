@@ -129,6 +129,23 @@ function markContextCompacted(res) {
 
 // === Per-Agent Session Store ===
 const sessions = new Map();  // keyed by agent ID (from `user` field)
+
+// Unkeyed clients must NOT collapse into a single shared bucket. The old loopback fallback
+// ('dev-agent') silently merged Hermes, OpenCode and ad-hoc scripts into ONE DeepSeek chat.
+// Derive a stable per-client key from remote address + User-Agent instead: one unkeyed client
+// keeps session continuity, unrelated unkeyed clients stay isolated.
+const UNKEYED_WARNED = new Set();
+function unkeyedAgentId(remoteAddr, userAgent) {
+    const addr = String(remoteAddr || 'unknown');
+    const ua = String(userAgent || '');
+    const digest = crypto.createHash('sha256').update(`${addr}\u0000${ua}`, 'utf8').digest('hex').slice(0, 12);
+    const id = `unkeyed-${digest}`;
+    if (!UNKEYED_WARNED.has(id)) {
+        UNKEYED_WARNED.add(id);
+        console.log(`[DS-API] Unkeyed client ${addr} (User-Agent: ${ua.slice(0, 60) || 'none'}) -> '${id}'. Send x-agent-session (or 'user') for an explicit, stable session key.`);
+    }
+    return id;
+}
 const MAX_HISTORY_LENGTH = 15;
 const MAX_HISTORY_CHARS = 10000;
 const MAX_MESSAGE_DEPTH = 100;  // auto-reset after this many messages
@@ -1336,6 +1353,26 @@ function nativeToolRepairPrompt(searchEnabled) {
         : `[STRICT INSTRUCTION] You called execute_code or a web tool that this gateway cannot run. Do not. Answer in plain text from what you already know. ${gatewayTool}`;
 }
 
+function noToolsRepairPrompt() {
+    return '[STRICT INSTRUCTION] This request does NOT support tool calls. Do NOT use any tools, tool markup, or tool-call JSON. Respond with a plain text final answer only. Do not attempt to call write_file, terminal, or any other tool.';
+}
+
+const NO_TOOLS_CONTRACT = '\n\n[NO-TOOLS CONTRACT] This request does NOT support tool calls. Do NOT use any tools, tool markup, DSML, or tool-call JSON. Respond with a plain text final answer only. Do not attempt to call write_file, terminal, or any other tool. Do not emit any JSON resembling a tool request.';
+
+function noToolsContract() {
+    return NO_TOOLS_CONTRACT;
+}
+
+function effectiveToolsForRequest(rawParams, webAccess) {
+    const supplied = webAccess.tools || [];
+    if (rawParams && rawParams.tool_choice === 'none') return [];
+    return supplied;
+}
+
+function isNoToolsRequest(rawParams, effectiveTools) {
+    return (effectiveTools || []).length === 0 || Boolean(rawParams && rawParams.tool_choice === 'none');
+}
+
 function stripHarnessWebSearchTools(tools) {
     const kept = [];
     const names = [];
@@ -1690,6 +1727,56 @@ function extractBalancedJsonObjects(text, maxObjects = MAX_TOOL_JSON_CANDIDATES)
         }
     }
     return objects;
+}
+
+const MAX_JSON_REPAIR_DEPTH = 64;
+
+/**
+ * Deterministic closing-delimiter-only JSON repair.
+ *
+ * Returns the repaired document ONLY when the input is a structurally sound JSON
+ * envelope that merely stops early: every string and escape is closed, no closing
+ * delimiter is mismatched with the open one it would close, at least one { or [ is
+ * still open at end-of-input, and appending exactly the missing closers produces a
+ * document JSON.parse accepts. No comma, value, field or character is ever invented
+ * or removed, so a recovered argument payload is byte-identical to the input bytes.
+ *
+ * Returns null for input that is already complete (existing behaviour unchanged) and
+ * for every case the append-only rule cannot make valid: unterminated string or
+ * escape, mismatched closer, missing colon, missing value, trailing comma, or an
+ * over-deep/oversized document.
+ */
+function repairTruncatedJsonEnvelope(text) {
+    if (typeof text !== 'string') return null;
+    const value = text.trim();
+    if (!value) return null;
+    const first = value[0];
+    if (first !== '{' && first !== '[') return null;
+    const closers = [];
+    let inString = false;
+    let escape = false;
+    for (let i = 0; i < value.length; i++) {
+        const ch = value[i];
+        if (escape) { escape = false; continue; }
+        if (inString) {
+            if (ch === '\\') { escape = true; continue; }
+            if (ch === '"') inString = false;
+            continue;
+        }
+        if (ch === '"') { inString = true; continue; }
+        if (ch === '{') { closers.push('}'); }
+        else if (ch === '[') { closers.push(']'); }
+        else if (ch === '}' || ch === ']') {
+            if (closers.length === 0 || closers[closers.length - 1] !== ch) return null;
+            closers.pop();
+        }
+        if (closers.length > MAX_JSON_REPAIR_DEPTH) return null;
+    }
+    if (inString || escape) return null;
+    if (closers.length === 0) return null;
+    const repaired = value + closers.reverse().join('');
+    try { JSON.parse(repaired); } catch (e) { return null; }
+    return repaired;
 }
 
 function buildToolCall(name, args = {}) {
@@ -2100,6 +2187,12 @@ function collectJsonToolCalls(text) {
     }
 
     for (const rawJson of extractBalancedJsonObjects(value)) absorbJsonToolPayload(rawJson, calls, seen);
+
+    // Closing-delimiter-only repair: a strict-JSON envelope truncated at the very end
+    // (all strings closed, only trailing }/] missing) is recovered by appending exactly
+    // the missing closers. absorbJsonToolPayload still enforces JSON.parse plus the
+    // normal envelope coercion, and collectAgentToolCalls still enforces the whitelist.
+    absorbJsonToolPayload(repairTruncatedJsonEnvelope(value), calls, seen);
     return calls;
 }
 
@@ -2204,6 +2297,14 @@ function parseToolCall(text) {
     for (const rawJson of extractBalancedJsonObjects(text)) {
         const tc = parseJsonToolCandidate(rawJson, 'inline');
         if (tc) return tc;
+    }
+
+    // Closing-delimiter-only repair (repairTruncatedJsonEnvelope): last resort for an
+    // envelope that ends early with only its final closers missing.
+    const repairedJson = repairTruncatedJsonEnvelope(text);
+    if (repairedJson) {
+        const repairedCall = parseJsonToolCandidate(repairedJson, 'repaired');
+        if (repairedCall) return repairedCall;
     }
 
     console.log(`[parseToolCall] No tool call match in ${text.length} chars`);
@@ -2955,6 +3056,7 @@ function formatMessages(messages, tools, options = {}) {
     }
     systemPrompt += formatToolDefinitions(tools);
     if (options.nativeSearchNotice) systemPrompt += nativeSearchAndThinkNotice();
+    if (options.noTools) systemPrompt += noToolsContract();
 
     // Build full conversation history for DeepSeek's context
     let conversation = '';
@@ -3015,7 +3117,10 @@ function resolveUpstreamPrompt(session, messages, tools, recoveryHistoryPrefix =
     const remoteLive = Boolean(session?.id);
     const omitSystem = remoteLive && Boolean(session.sentSystemFingerprint);
     const delta = continuationMessages(messages);
-    const conversation = remoteLive ? formatMessages(delta, [], options).prompt : formatted.prompt;
+    let conversation = remoteLive ? formatMessages(delta, [], options).prompt : formatted.prompt;
+    if (options.noTools && omitSystem) {
+        conversation = appendPromptInstruction(conversation, noToolsContract());
+    }
     return {
         systemPrompt: omitSystem ? '' : formatted.systemPrompt,
         conversation,
@@ -4254,14 +4359,16 @@ const server = http.createServer(async (req, res) => {
             const requestedModel = canonicalizeModelId(params.model || DEFAULT_MODEL_ID);
             const webFlags = resolveRequestWebFlags(requestedModel, rawParams);
             const webAccess = prepareAgentWebAccess(params.tools, webFlags.search_enabled);
-            const tools = webAccess.tools;
-            const promptOptions = { nativeSearchNotice: webAccess.nativeSearchNotice };
+            const effectiveTools = effectiveToolsForRequest(rawParams, webAccess);
+            const tools = effectiveTools;
+            const requestNoToolsMode = isNoToolsRequest(rawParams, effectiveTools);
+            const promptOptions = { nativeSearchNotice: webAccess.nativeSearchNotice, noTools: requestNoToolsMode };
             logRow.model = requestedModel;
             const remoteAddr = req.socket.remoteAddress || 'unknown';
             const requestedSession = req.headers['x-agent-session'] || params.session || params.user;
             const agentId = requestedSession
                 ? String(requestedSession)
-                : ((remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1') ? 'dev-agent' : remoteAddr);
+                : unkeyedAgentId(remoteAddr, req.headers['user-agent']);
             const agentTag = `[${agentId}]`;
             activeAgentId = agentId;
             lockHolder.agentId = agentId;
@@ -4769,6 +4876,7 @@ const server = http.createServer(async (req, res) => {
             const allowedToolNames = new Set(tools
                 .filter(tool => tool?.type === 'function' && tool.function?.name)
                 .map(tool => tool.function.name));
+            const noToolsMode = allowedToolNames.size === 0;
             let toolCalls = collectAgentToolCalls(fullContent, allowedToolNames);
             let toolCall = toolCalls[0] || selectAgentToolCall(fullContent, allowedToolNames);
             let ignoredNativeTool = null;
@@ -4779,7 +4887,7 @@ const server = http.createServer(async (req, res) => {
             } else if (toolCall && allowedToolNames.size > 0 && !allowedToolNames.has(toolCall.name)) {
                 console.log(`${agentTag} Model requested unknown tool ${toolCall.name}; attempting format repair.`);
                 toolCall = null;
-            } else if (toolCall && allowedToolNames.size === 0 && looksLikeToolCallMarkup(fullContent)) {
+            } else if (toolCall && noToolsMode && looksLikeToolCallMarkup(fullContent)) {
                 // Chat-only clients must not receive raw DSML as the answer.
                 ignoredNativeTool = toolCall.name;
                 toolCall = null;
@@ -4787,65 +4895,133 @@ const server = http.createServer(async (req, res) => {
 
             const dsmlCalls = listDsmlToolCalls(fullContent);
             const nativeOnlyDsml = dsmlCalls.length > 0 && dsmlCalls.every(call => isDeepSeekNativeTool(call.name));
-            const shouldRepairNative = !toolCall && (Boolean(ignoredNativeTool) || nativeOnlyDsml);
-            const shouldRepairMarkup = !toolCall && !shouldRepairNative && looksLikeToolCallMarkup(fullContent);
-            const shouldRepairCodeDump = allowedToolNames.size > 0 && !toolCall && !shouldRepairMarkup && !shouldRepairNative && looksLikeCodeDumpInsteadOfTool(fullContent);
-            const shouldRepairAbandoned = allowedToolNames.size > 0 && !toolCall && !shouldRepairMarkup && !shouldRepairNative && !shouldRepairCodeDump && looksLikeAbandonedToolLoop(fullContent, messages);
-            if ((shouldRepairMarkup || shouldRepairCodeDump || shouldRepairNative || shouldRepairAbandoned) && !clientGone && !deadlineHit()) {
-                const reason = shouldRepairNative
-                    ? `Model called DeepSeek-native ${ignoredNativeTool || dsmlCalls.map(call => call.name).join(', ') || 'tool'}`
-                    : (shouldRepairMarkup
-                        ? 'Tool-call markup detected but invalid/truncated'
-                        : (shouldRepairCodeDump
-                            ? 'Model dumped source code instead of a tool request'
-                            : 'Model stopped after a tool result without a next tool call'));
+            const shouldRepairNative = !noToolsMode && !toolCall && (Boolean(ignoredNativeTool) || nativeOnlyDsml);
+            const shouldRepairMarkup = !noToolsMode && !toolCall && !shouldRepairNative && looksLikeToolCallMarkup(fullContent);
+            const shouldRepairCodeDump = !noToolsMode && allowedToolNames.size > 0 && !toolCall && !shouldRepairMarkup && !shouldRepairNative && looksLikeCodeDumpInsteadOfTool(fullContent);
+            const shouldRepairAbandoned = !noToolsMode && allowedToolNames.size > 0 && !toolCall && !shouldRepairMarkup && !shouldRepairNative && !shouldRepairCodeDump && looksLikeAbandonedToolLoop(fullContent, messages);
+            const shouldRepairNoTools = noToolsMode && !toolCall && !shouldRepairNative && looksLikeToolCallMarkup(fullContent);
+            let repairRateLimitError = null;
+            let repairUnavailable = false;
+            if ((shouldRepairMarkup || shouldRepairCodeDump || shouldRepairNative || shouldRepairAbandoned || shouldRepairNoTools) && !clientGone && !deadlineHit()) {
+                const reason = shouldRepairNoTools
+                    ? 'Model emitted tool markup but this request has no tools'
+                    : (shouldRepairNative
+                        ? `Model called DeepSeek-native ${ignoredNativeTool || dsmlCalls.map(call => call.name).join(', ') || 'tool'}`
+                        : (shouldRepairMarkup
+                            ? 'Tool-call markup detected but invalid/truncated'
+                            : (shouldRepairCodeDump
+                                ? 'Model dumped source code instead of a tool request'
+                                : 'Model stopped after a tool result without a next tool call')));
                 console.log(`${agentTag} ${reason} (${fullContent.length} chars). Retrying with stricter prompt on the same session...`);
-                const strictPrompt = shouldRepairNative
-                    ? nativeToolRepairPrompt(webFlags.search_enabled)
-                    : (shouldRepairMarkup
-                        ? '[STRICT INSTRUCTION] Your previous response contained incomplete tool-call markup. Keep arguments short and output ONLY strict JSON: {"tool_call":{"name":"<function>","arguments":{...}}}'
-                        : (shouldRepairCodeDump
-                            ? '[STRICT INSTRUCTION] You pasted source code as plain text. This gateway cannot apply pasted files. Request exactly one tool to write or edit the file. Output ONLY strict JSON: {"tool_call":{"name":"<function>","arguments":{...}}}. Put file contents in the tool arguments, not in markdown fences.'
-                            : '[STRICT INSTRUCTION] You stopped after a tool result. Continue the task. Output exactly one gateway tool request as {"tool_call":{"name":"<function>","arguments":{...}}} or a complete final answer if the work is finished.'));
+                const strictPrompt = shouldRepairNoTools
+                    ? noToolsRepairPrompt()
+                    : (shouldRepairNative
+                        ? nativeToolRepairPrompt(webFlags.search_enabled)
+                        : (shouldRepairMarkup
+                            ? '[STRICT INSTRUCTION] Your previous response contained incomplete tool-call markup. Keep arguments short and output ONLY strict JSON: {"tool_call":{"name":"<function>","arguments":{...}}}'
+                            : (shouldRepairCodeDump
+                                ? '[STRICT INSTRUCTION] You pasted source code as plain text. This gateway cannot apply pasted files. Request exactly one tool to write or edit the file. Output ONLY strict JSON: {"tool_call":{"name":"<function>","arguments":{...}}}. Put file contents in the tool arguments, not in markdown fences.'
+                                : '[STRICT INSTRUCTION] You stopped after a tool result. Continue the task. Output exactly one gateway tool request as {"tool_call":{"name":"<function>","arguments":{...}}} or a complete final answer if the work is finished.')));
+                // The repair call is a recovery call: it keeps the full request context
+                // (system rules, transcript, pinned tool schema) and adds the repair
+                // directive, and it must be able to use the next ready login when the
+                // account that produced the malformed envelope is throttled (#21). Every
+                // account is tried at most once, a cooling account is never retried, and
+                // the loop stops on client disconnect or request deadline.
+                const repairRecoveryPrompt = appendPromptInstruction(freshPrompt, strictPrompt);
                 let retryResult2 = null;
-                try {
-                    const repairCall = await askDeepSeekStream(strictPrompt, agentId, requestedModel, strictPrompt, lockHolder, imageContext, webFlags);
-                    retryResult2 = await readDeepSeekResponse(repairCall.resp.body, repairCall.account);
-                } catch (e) {
-                    if (!isRateLimitedPoolOrAccount(e)) throw e;
-                    console.log(`${agentTag} strict repair skipped: ${e.message}`);
+                let repairAttempts = 0;
+                const repairMaxHops = Math.max(1, accounts.length);
+                for (let hop = 0; hop < repairMaxHops; hop++) {
+                    if (clientGone || deadlineHit()) break;
+                    repairAttempts++;
+                    try {
+                        const repairCall = await askDeepSeekStream(
+                            hop === 0 ? strictPrompt : repairRecoveryPrompt,
+                            agentId, requestedModel, repairRecoveryPrompt, lockHolder, imageContext, webFlags
+                        );
+                        const repairRead = await readDeepSeekResponse(repairCall.resp.body, repairCall.account);
+                        if (!repairRead.rateLimited) { retryResult2 = repairRead; break; }
+                        repairRateLimitError = repairRead.rateLimitError || repairRateLimitError;
+                        console.log(`${agentTag} strict repair rate-limited on account ${repairCall.account.id}; trying the next ready login.`);
+                    } catch (e) {
+                        if (!isRateLimitedPoolOrAccount(e)) throw e;
+                        repairRateLimitError = e;
+                        console.log(`${agentTag} strict repair has no ready login: ${e.message}`);
+                        // A pool-wide 429 means every login is cooling down: no hop can succeed.
+                        if (!isAccountRateLimitError(e)) break;
+                    }
+                    // Uploaded file ids and the chat lock belong to the throttled login.
+                    releaseAccountChatLock(lockHolder);
+                    if (imageContext?.refFileIds) imageContext.refFileIds.length = 0;
                 }
-                if (retryResult2?.rateLimited) {
-                    console.log(`${agentTag} strict repair rate-limited; keeping the original reply.`);
-                    retryResult2 = null;
+                if (!retryResult2) {
+                    repairUnavailable = Boolean(repairRateLimitError);
+                    console.log(`${agentTag} strict repair was not completed after ${repairAttempts} attempt(s): ${repairRateLimitError?.message || 'no ready login'}.`);
                 }
                 const retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
                 if (retryContent2 && retryContent2.trim()) {
-                    const retryTc = selectAgentToolCall(retryContent2, allowedToolNames);
-                    const retryAccepted = retryTc && (
-                        (allowedToolNames.size > 0 && allowedToolNames.has(retryTc.name))
-                        || (allowedToolNames.size === 0 && !isDeepSeekNativeTool(retryTc.name))
-                    );
-                    if (retryAccepted) {
-                        const retryCalls = collectAgentToolCalls(retryContent2, allowedToolNames);
-                        console.log(`${agentTag} Retry with strict prompt succeeded: ${(retryCalls.length ? retryCalls : [retryTc]).map(call => call.name).join(', ')}`);
-                        fullContent = retryContent2;
-                        reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : '';
-                        toolCalls = retryCalls.length ? retryCalls : [retryTc];
-                        toolCall = toolCalls[0];
-                    } else if (!looksLikeToolCallMarkup(retryContent2) && !looksLikeCodeDumpInsteadOfTool(retryContent2)) {
-                        console.log(`${agentTag} Retry produced a plain-text answer; using it.`);
-                        fullContent = retryContent2;
-                        reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : reasoningContent;
+                    if (shouldRepairNoTools) {
+                        if (!looksLikeToolCallMarkup(retryContent2)) {
+                            console.log(`${agentTag} No-tools retry produced a plain-text answer; using it.`);
+                            fullContent = retryContent2;
+                            reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : reasoningContent;
+                        } else {
+                            console.log(`${agentTag} No-tools retry still has tool markup. Returning explicit failure.`);
+                            reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : reasoningContent;
+                        }
                     } else {
-                        console.log(`${agentTag} Retry still has ${shouldRepairMarkup || shouldRepairNative ? 'broken/native tool markup' : 'no tool request'}. ${shouldRepairCodeDump ? 'Passing the original text through.' : 'Returning a safe error instead of leaking it as text.'}`);
-                        reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : reasoningContent;
+                        const retryTc = selectAgentToolCall(retryContent2, allowedToolNames);
+                        const retryAccepted = retryTc && (
+                            (allowedToolNames.size > 0 && allowedToolNames.has(retryTc.name))
+                            || (allowedToolNames.size === 0 && !isDeepSeekNativeTool(retryTc.name))
+                        );
+                        if (retryAccepted) {
+                            const retryCalls = collectAgentToolCalls(retryContent2, allowedToolNames);
+                            console.log(`${agentTag} Retry with strict prompt succeeded: ${(retryCalls.length ? retryCalls : [retryTc]).map(call => call.name).join(', ')}`);
+                            fullContent = retryContent2;
+                            reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : '';
+                            toolCalls = retryCalls.length ? retryCalls : [retryTc];
+                            toolCall = toolCalls[0];
+                        } else if (!looksLikeToolCallMarkup(retryContent2) && !looksLikeCodeDumpInsteadOfTool(retryContent2)) {
+                            console.log(`${agentTag} Retry produced a plain-text answer; using it.`);
+                            fullContent = retryContent2;
+                            reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : reasoningContent;
+                        } else {
+                            console.log(`${agentTag} Retry still has ${shouldRepairMarkup || shouldRepairNative ? 'broken/native tool markup' : 'no tool request'}. ${shouldRepairCodeDump ? 'Passing the original text through.' : 'Returning a safe error instead of leaking it as text.'}`);
+                            reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : reasoningContent;
+                        }
                     }
                 }
             }
 
+            // No repair could be obtained: every login that could have served it was
+            // throttled. Re-throw the retained rate-limit error so the existing outer
+            // typed-error handler answers 429 + the real Retry-After, in tools mode and
+            // in no-tools mode alike, instead of mislabelling the request as a model
+            // verdict (malformed_tool_call / no_tools_but_tool_markup).
+            if (repairUnavailable) throw repairRateLimitError;
             if (!toolCall && looksLikeToolCallMarkup(fullContent)) {
                 const failure = { failedSessionId: session.id, failedMessageCount: session.messageCount, accountId: session.accountId };
+                if (noToolsMode) {
+                    console.log(`${agentTag} No-tools request still has tool markup after repair.`);
+                    logError(502, 'no_tools_but_tool_markup', 'Model emitted tool markup after being told no tools are allowed');
+                    logRow.account = session.accountId;
+                    res.writeHead(502, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: {
+                        message: 'Model emitted tool markup after being told no tools are allowed',
+                        type: 'no_tools_but_tool_markup',
+                        agent: agentId,
+                        failed_session_id: failure.failedSessionId,
+                        message_count: failure.failedMessageCount,
+                        history_length: session.history.length,
+                        account: failure.accountId,
+                        prompt_compacted: promptCompacted,
+                        model: requestedModel,
+                        real_model: resolveModelConfig(requestedModel).real_model,
+                    } }));
+                    return;
+                }
                 console.log(`${agentTag} Keeping chat ${session.id || '(none)'} after malformed tool markup.`);
                 logError(502, 'malformed_tool_call', 'DeepSeek returned malformed or native-only tool-call markup after one repair attempt');
                 logRow.account = session.accountId;
@@ -4964,7 +5140,7 @@ const server = http.createServer(async (req, res) => {
 
 async function runAuthScript() {
     const script = path.join(__dirname, 'scripts', 'deepseek_chrome_auth.js');
-    const result = spawnSync(process.execPath, [script], { stdio: 'inherit', env: process.env });
+    const result = spawnSync(process.execPath, [script], { stdio: 'inherit', env: process.env, windowsHide: true });
     loadDeepSeekConfig({ fatal: false });
     return result.status === 0 && hasAuthConfig();
 }
@@ -5051,7 +5227,7 @@ async function showStartupMenu() {
         );
         if (chosen.id === 'login') await runAuthScript();
         else if (chosen.id === 'import') {
-            spawnSync(process.execPath, [path.join(__dirname, 'scripts', 'auth_import.js')], { stdio: 'inherit', env: process.env });
+            spawnSync(process.execPath, [path.join(__dirname, 'scripts', 'auth_import.js')], { stdio: 'inherit', env: process.env, windowsHide: true });
             loadDeepSeekConfig({ fatal: false });
         } else if (chosen.id === 'models') {
             await showModels(langRef);
@@ -5160,6 +5336,7 @@ module.exports = {
         formatToolReminder,
         pinToolReminder,
         parseToolCall,
+        repairTruncatedJsonEnvelope,
         listDsmlToolCalls,
         collectAgentToolCalls,
         buildToolCallResponse,
@@ -5170,6 +5347,10 @@ module.exports = {
         isDeepSeekNativeTool,
         emptyResponseNudge,
         nativeToolRepairPrompt,
+        noToolsRepairPrompt,
+        noToolsContract,
+        effectiveToolsForRequest,
+        isNoToolsRequest,
         splitConversationTurns,
         compactConversation,
         truncatePromptMiddle,

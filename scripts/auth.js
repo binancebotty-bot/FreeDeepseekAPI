@@ -61,6 +61,7 @@ async function panel(langRef, subtitleKey, status, extraItems = []) {
 function runDirectAuth() {
   return spawnSync(process.execPath, [path.join(__dirname, 'deepseek_chrome_auth.js')], {
     stdio: 'inherit',
+    windowsHide: true,
     env: { ...process.env, FREDEEPSEEK_EMBEDDED: '1' },
   }).status;
 }
@@ -68,6 +69,7 @@ function runDirectAuth() {
 function runAgentSetup() {
   return spawnSync(process.execPath, [path.join(__dirname, 'setup-agents.js')], {
     stdio: 'inherit',
+    windowsHide: true,
   }).status;
 }
 

@@ -18,7 +18,7 @@ function run() {
     const env = { ...process.env, FDSA_LAUNCHER: '1' };
     // A restart skips the start menu and does not open another browser tab.
     if (restarts > 0) Object.assign(env, { FDSA_RESTARTED: '1', SKIP_ACCOUNT_MENU: '1' });
-    child = spawn(process.execPath, [entry, ...args], { stdio: 'inherit', env });
+    child = spawn(process.execPath, [entry, ...args], { stdio: 'inherit', env, windowsHide: true });
     child.on('error', (err) => {
         console.error(`[launcher] Could not start ${entry}: ${err.message}`);
         process.exit(1);
