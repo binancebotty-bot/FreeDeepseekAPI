@@ -1323,3 +1323,457 @@ test('dashboard serves flat lowercase .js/.css/.svg assets from its folder and n
   assert.equal(res.status, 200);
   assert.match(res.headers['content-security-policy'], /default-src 'none'/);
 });
+
+// ---------------------------------------------------------------------------
+// Repair rotation regression (RED before the fix / GREEN after).
+//
+// Synthetic scenario, NOT a captured production payload (none was retained):
+//   sticky account A answers the original request with an unparseable tool
+//   envelope, then the strict repair call on A hits a rate-limit HINT_SSE.
+//   A healthy account B is ready and must serve the repair with the full
+//   request context plus the pinned repair directive.
+// ---------------------------------------------------------------------------
+
+const TOOL_SCHEMA = [{
+  type: 'function',
+  function: {
+    name: 'read_file',
+    description: 'Read a file from disk',
+    parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+  },
+}];
+const MALFORMED_TOOL_ENVELOPE = '<tool_call>read_file(path=';
+const VALID_TOOL_CALL = '{"tool_call":{"name":"read_file","arguments":{"path":"C:/tmp/notes.txt"}}}';
+
+function repairPayloadText(calls, account) {
+  const sent = byPath(calls, COMPLETION, account);
+  return sent.map(c => String(c.body?.prompt ?? '')).join('\n');
+}
+
+function assertRepairContext(text, label) {
+  assert.match(text, /SYSTEM_RULES/, `${label}: system rules must survive the repair hop`);
+  assert.match(text, /TASK_ONE original task/, `${label}: original task must survive the repair hop`);
+  assert.match(text, /read_file/, `${label}: current tool schema must survive the repair hop`);
+  assert.match(text, /Read a file from disk/, `${label}: tool schema description must survive the repair hop`);
+  assert.match(text, /\[STRICT INSTRUCTION\]/, `${label}: pinned repair directive must be sent`);
+}
+
+for (const stream of [false, true]) {
+  test(`repair rate limit fails over to a ready account (stream=${stream})`, async (t) => {
+    const A = acct('A');
+    const B = acct('B');
+    useAccounts(t, [A, B]);
+    const calls = installUpstream(t, {
+      completion: {
+        A: [() => sse(okSse(MALFORMED_TOOL_ENVELOPE)), () => sse(HINT_SSE)],
+        B: [() => sse(okSse(VALID_TOOL_CALL))],
+      },
+    });
+    const agent = `repair-rotation-${stream ? 'stream' : 'json'}`;
+    seedStickySession(t, agent, 'A', 'old-A');
+    const port = await startServer(t);
+
+    const res = await chat(port, agent, HISTORY_MESSAGES, { tools: TOOL_SCHEMA, stream, tool_choice: 'auto' });
+
+    assert.equal(res.status, 200, `expected HTTP 200 from the repaired call, got ${res.status}: ${res.text.slice(0, 400)}`);
+    if (stream) {
+      assert.match(res.text, /"tool_calls"/, 'streamed response must carry tool_calls');
+      assert.match(res.text, /read_file/, 'streamed response must carry the repaired call name');
+    } else {
+      const msg = res.json?.choices?.[0]?.message;
+      assert.ok(Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0, `expected tool_calls, got ${JSON.stringify(res.json).slice(0, 400)}`);
+      assert.equal(msg.tool_calls[0].function.name, 'read_file');
+      assert.match(String(msg.tool_calls[0].function.arguments || ''), /notes\.txt/);
+    }
+    assert.ok(byPath(calls, COMPLETION, 'B').length >= 1, 'the ready account B must serve the repair');
+    assertRepairContext(repairPayloadText(calls, 'B'), 'B repair payload');
+  });
+}
+
+test('negative control: all accounts cooling yields bounded attempts and an honest rate_limit', async (t) => {
+  const A = acct('A');
+  const B = acct('B', { cooldownUntil: Date.now() + 60_000, cooldownReason: 'rate_limit' });
+  useAccounts(t, [A, B]);
+  const calls = installUpstream(t, {
+    completion: {
+      A: [() => sse(okSse(MALFORMED_TOOL_ENVELOPE)), () => sse(HINT_SSE)],
+      B: [() => sse(okSse(VALID_TOOL_CALL))],
+    },
+  });
+  const agent = 'repair-rotation-allcool';
+  seedStickySession(t, agent, 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, agent, HISTORY_MESSAGES, { tools: TOOL_SCHEMA });
+
+  assert.equal(res.status, 429, `pool exhausted during repair must be an honest 429, got ${res.status}: ${res.text.slice(0, 300)}`);
+  assert.equal(res.json?.error?.type, 'rate_limit');
+  assert.equal(byPath(calls, COMPLETION, 'A').length, 2, 'A: one original call plus exactly one repair attempt (bounded)');
+  assert.equal(byPath(calls, COMPLETION, 'B').length, 0, 'a cooling account must never be called');
+});
+
+test('negative control: second account also malformed stays a safe error', async (t) => {
+  const A = acct('A');
+  const B = acct('B');
+  useAccounts(t, [A, B]);
+  const calls = installUpstream(t, {
+    completion: {
+      A: [() => sse(okSse(MALFORMED_TOOL_ENVELOPE)), () => sse(HINT_SSE)],
+      B: [() => sse(okSse(MALFORMED_TOOL_ENVELOPE))],
+    },
+  });
+  const agent = 'repair-rotation-secondmalformed';
+  seedStickySession(t, agent, 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, agent, HISTORY_MESSAGES, { tools: TOOL_SCHEMA });
+
+  assert.equal(res.status, 502, `still-broken repair must fail safely, got ${res.status}: ${res.text.slice(0, 300)}`);
+  assert.equal(res.json?.error?.type, 'malformed_tool_call');
+  assert.doesNotMatch(res.text, /"tool_calls"/, 'no tool_calls may be invented');
+  assert.ok(byPath(calls, COMPLETION, 'B').length >= 1, 'B was tried and failed');
+  assertRepairContext(repairPayloadText(calls, 'B'), 'B repair payload');
+});
+
+test('negative control: a no-tools request can never emit tool_calls', async (t) => {
+  const A = acct('A');
+  const B = acct('B');
+  useAccounts(t, [A, B]);
+  const calls = installUpstream(t, {
+    completion: {
+      A: [() => sse(okSse(MALFORMED_TOOL_ENVELOPE)), () => sse(HINT_SSE)],
+      B: [() => sse(okSse(VALID_TOOL_CALL))],
+    },
+  });
+  const agent = 'repair-rotation-notools';
+  seedStickySession(t, agent, 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, agent, HISTORY_MESSAGES);
+
+  assert.equal(res.status, 502, `no-tools request must not be answered with a tool call, got ${res.status}: ${res.text.slice(0, 300)}`);
+  assert.doesNotMatch(res.text, /"tool_calls"/, 'no-tools mode must never emit tool_calls');
+  assert.doesNotMatch(res.text, /notes\.txt/, 'no-tools mode must never leak the upstream tool payload');
+});
+
+test('second strict repair recovers a malformed first repair without exposing a 502 to Hermes', async (t) => {
+  const A = acct('A');
+  useAccounts(t, [A]);
+  const calls = installUpstream(t, {
+    completion: { A: [
+      () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+      () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+      () => sse(okSse(VALID_TOOL_CALL)),
+    ] },
+  });
+  const agent = 'repair-rotation-second-format-repair';
+  seedStickySession(t, agent, 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, agent, HISTORY_MESSAGES, { tools: TOOL_SCHEMA });
+
+  assert.equal(res.status, 200, 'a valid second repair must avoid the client-level 502/retry/fallback path');
+  assert.equal(res.json?.choices?.[0]?.message?.tool_calls?.[0]?.function?.name, 'read_file');
+  assert.equal(byPath(calls, COMPLETION, 'A').length, 3, 'one original call plus two bounded repair attempts');
+});
+
+test('fresh-session rotation recovers repeated malformed repairs before client retry/fallback', async (t) => {
+  const A = acct('A');
+  const B = acct('B');
+  useAccounts(t, [A, B]);
+  const calls = installUpstream(t, {
+    completion: {
+      A: [
+        () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+        () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+        () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+      ],
+      B: [() => sse(okSse(VALID_TOOL_CALL))],
+    },
+  });
+  const agent = 'repair-rotation-fresh-session-after-malformed';
+  seedStickySession(t, agent, 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, agent, HISTORY_MESSAGES, { tools: TOOL_SCHEMA });
+
+  assert.equal(res.status, 200, `fresh-session recovery should prevent a client-level retry/fallback, got ${res.status}: ${res.text.slice(0, 300)}`);
+  assert.equal(res.json?.choices?.[0]?.message?.tool_calls?.[0]?.function?.name, 'read_file');
+  assert.equal(byPath(calls, COMPLETION, 'A').length, 3, 'A gets original plus two bounded same-account format repairs');
+  assert.equal(byPath(calls, COMPLETION, 'B').length, 1, 'a ready alternate login gets one clean-context recovery call');
+  assertRepairContext(repairPayloadText(calls, 'B'), 'fresh-session B recovery payload');
+  assert.equal(byPath(calls, SESSION_CREATE, 'B').length, 1, 'B must own a newly-created remote chat');
+  assert.notEqual(byPath(calls, COMPLETION, 'B')[0].body.chat_session_id, 'old-A', 'the malformed A chat must not be reused');
+});
+
+test('fresh-session recovery respects an explicitly pinned account', async (t) => {
+  const A = acct('A');
+  const B = acct('B');
+  useAccounts(t, [A, B]);
+  const calls = installUpstream(t, {
+    completion: {
+      A: [
+        () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+        () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+        () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+        () => sse(okSse(VALID_TOOL_CALL)),
+      ],
+      B: [() => sse(okSse(VALID_TOOL_CALL))],
+    },
+  });
+  const agent = 'repair-rotation-fresh-session-pinned';
+  seedStickySession(t, agent, 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await request(port, 'POST', '/v1/chat/completions', {
+    body: { model: 'deepseek-v4-flash', messages: HISTORY_MESSAGES, tools: TOOL_SCHEMA },
+    headers: { 'x-agent-session': agent, 'x-account-id': 'A' },
+  });
+
+  assert.equal(res.status, 200, `pinned fresh-session recovery should succeed, got ${res.status}: ${res.text.slice(0, 300)}`);
+  assert.equal(byPath(calls, COMPLETION, 'A').length, 4, 'the pinned login gets one fresh-context recovery call');
+  assert.equal(byPath(calls, COMPLETION, 'B').length, 0, 'explicit account pin must never be bypassed');
+});
+
+test('unchanged normal successful repair still works on the sticky account', async (t) => {
+  const A = acct('A');
+  useAccounts(t, [A]);
+  const calls = installUpstream(t, {
+    completion: { A: [() => sse(okSse(MALFORMED_TOOL_ENVELOPE)), () => sse(okSse(VALID_TOOL_CALL))] },
+  });
+  const agent = 'repair-rotation-happy';
+  seedStickySession(t, agent, 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, agent, HISTORY_MESSAGES, { tools: TOOL_SCHEMA });
+
+  assert.equal(res.status, 200, `normal repair must keep working, got ${res.status}: ${res.text.slice(0, 300)}`);
+  assert.equal(res.json?.choices?.[0]?.message?.tool_calls?.[0]?.function?.name, 'read_file');
+  assert.equal(byPath(calls, COMPLETION, 'A').length, 2, 'one original call plus one repair, no extra hops');
+});
+
+// ---------------------------------------------------------------------------
+// Adversarial-review remediation tests (candidate v1 bugs):
+//   1. the manual 429 branch invented retryAfterSec/retry_after_sec and defaulted
+//      to 1s, so Retry-After was wrong and clients retried too early;
+//   2. the noTools branch ran before the repairUnavailable check, so an exhausted
+//      repair was mislabelled 502 no_tools_but_tool_markup.
+// Synthetic scenario only; no production payload was retained.
+// ---------------------------------------------------------------------------
+
+function retryAfterSeconds(res) {
+  const raw = res.headers['retry-after'];
+  return raw === undefined ? null : Number(raw);
+}
+
+test('review: all accounts cooling in tools mode returns 429 with the real Retry-After, not 1s', async (t) => {
+  const A = acct('A');
+  const B = acct('B', { cooldownUntil: Date.now() + 60_000, cooldownReason: 'rate_limit' });
+  useAccounts(t, [A, B]);
+  installUpstream(t, {
+    completion: {
+      A: [() => sse(okSse(MALFORMED_TOOL_ENVELOPE)), () => sse(HINT_SSE)],
+      B: [() => sse(okSse(VALID_TOOL_CALL))],
+    },
+  });
+  const agent = 'review-allcool-tools';
+  seedStickySession(t, agent, 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, agent, HISTORY_MESSAGES, { tools: TOOL_SCHEMA });
+
+  assert.equal(res.status, 429, `expected an honest 429, got ${res.status}: ${res.text.slice(0, 300)}`);
+  assert.match(String(res.json?.error?.type || ''), /rate_limit/);
+  const wait = retryAfterSeconds(res);
+  assert.ok(wait !== null && Number.isFinite(wait), `Retry-After must be present, got ${res.headers['retry-after']}`);
+  assert.notEqual(wait, 1, 'Retry-After must not fall back to the hard-coded 1s default');
+  assert.ok(wait >= 30 && wait <= 120, `Retry-After must reflect the real account cooldown (~60s), got ${wait}`);
+  assert.doesNotMatch(res.text, /"tool_calls"/);
+});
+
+test('review: all accounts cooling in no-tools mode returns the same 429 and never a 502 no-tools verdict', async (t) => {
+  const A = acct('A');
+  const B = acct('B', { cooldownUntil: Date.now() + 60_000, cooldownReason: 'rate_limit' });
+  useAccounts(t, [A, B]);
+  installUpstream(t, {
+    completion: {
+      A: [() => sse(okSse(MALFORMED_TOOL_ENVELOPE)), () => sse(HINT_SSE)],
+      B: [() => sse(okSse(VALID_TOOL_CALL))],
+    },
+  });
+  const agent = 'review-allcool-notools';
+  seedStickySession(t, agent, 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, agent, HISTORY_MESSAGES);
+
+  assert.equal(res.status, 429, `an exhausted repair must be a 429 even without tools, got ${res.status}: ${res.text.slice(0, 300)}`);
+  assert.match(String(res.json?.error?.type || ''), /rate_limit/);
+  assert.notEqual(res.json?.error?.type, 'no_tools_but_tool_markup');
+  const wait = retryAfterSeconds(res);
+  assert.ok(wait !== null && wait >= 30 && wait <= 120, `Retry-After must reflect the real cooldown, got ${wait}`);
+  assert.doesNotMatch(res.text, /"tool_calls"/);
+  assert.doesNotMatch(res.text, /notes\.txt/);
+});
+
+test('review: no-tools request whose repair lands on a healthy account returns the plain answer with no tools', async (t) => {
+  const A = acct('A');
+  const B = acct('B');
+  useAccounts(t, [A, B]);
+  installUpstream(t, {
+    completion: {
+      A: [() => sse(okSse(MALFORMED_TOOL_ENVELOPE)), () => sse(HINT_SSE)],
+      B: [() => sse(okSse('plain answer from B'))],
+    },
+  });
+  const agent = 'review-notools-healthy';
+  seedStickySession(t, agent, 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, agent, HISTORY_MESSAGES);
+
+  assert.equal(res.status, 200, `expected 200, got ${res.status}: ${res.text.slice(0, 300)}`);
+  assert.match(res.text, /plain answer from B/);
+  assert.doesNotMatch(res.text, /"tool_calls"/, 'no-tools mode must never emit tool_calls');
+});
+
+test('review: a third healthy account serves the repair after two rate-limited accounts, context intact', async (t) => {
+  const A = acct('A');
+  const B = acct('B');
+  const C = acct('C');
+  useAccounts(t, [A, B, C]);
+  const calls = installUpstream(t, {
+    completion: {
+      A: [() => sse(okSse(MALFORMED_TOOL_ENVELOPE)), () => sse(HINT_SSE)],
+      B: [() => sse(HINT_SSE)],
+      C: [() => sse(okSse(VALID_TOOL_CALL))],
+    },
+  });
+  const agent = 'review-third-account';
+  seedStickySession(t, agent, 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, agent, HISTORY_MESSAGES, { tools: TOOL_SCHEMA });
+
+  assert.equal(res.status, 200, `expected 200 from C, got ${res.status}: ${res.text.slice(0, 300)}`);
+  assert.equal(res.json?.choices?.[0]?.message?.tool_calls?.[0]?.function?.name, 'read_file');
+  assert.ok(byPath(calls, COMPLETION, 'B').length >= 1, 'B must have been tried once');
+  assert.ok(byPath(calls, COMPLETION, 'C').length >= 1, 'C must serve the repair');
+  assertRepairContext(repairPayloadText(calls, 'C'), 'C repair payload');
+});
+
+// === NO-TOOLS CONTRACT HTTP REGRESSION ===
+// Raw in-process fetch mock (NOT provider live). Captures actual upstream HTTP body.
+// Verifies NO-TOOLS CONTRACT is present in outgoing completion prompt on sticky no-tools requests.
+
+const NO_TOOLS_MARKER = '[NO-TOOLS CONTRACT]';
+
+function seedStickyWithFingerprint(t, agent, accountId, sessionId) {
+  const session = seedStickySession(t, agent, accountId, sessionId);
+  session.sentSystemFingerprint = 'fp-preseeded';
+  return session;
+}
+
+test('HTTP: sticky no-tools request carries NO-TOOLS CONTRACT in upstream prompt', async (t) => {
+  const A = acct('A');
+  useAccounts(t, [A]);
+  const calls = installUpstream(t, { completion: { A: [() => sse(okSse('plain answer'))] } });
+  seedStickyWithFingerprint(t, 'nt-sticky', 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, 'nt-sticky', [
+    { role: 'system', content: 'SYS_RULES' },
+    { role: 'user', content: 'TASK do something' },
+  ]);
+
+  assert.equal(res.status, 200, res.text);
+  const completions = byPath(calls, COMPLETION, 'A');
+  assert.equal(completions.length, 1);
+  const sentPrompt = completions[0].body.prompt;
+  assert.ok(sentPrompt.includes(NO_TOOLS_MARKER),
+    `upstream prompt MUST contain NO-TOOLS CONTRACT. Got: ${sentPrompt.substring(0, 300)}`);
+  assert.ok(!sentPrompt.includes('Available tools:') && !sentPrompt.includes('TOOL_REMINDER') && !sentPrompt.includes('"type":"function"'),
+    'upstream prompt must NOT advertise tools');
+});
+
+test('HTTP: tool_choice none with tools schemas yields empty effective toolset', async (t) => {
+  const A = acct('A');
+  useAccounts(t, [A]);
+  const calls = installUpstream(t, { completion: { A: [() => sse(okSse('plain'))] } });
+  seedStickyWithFingerprint(t, 'nt-tcnone', 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, 'nt-tcnone', [{ role: 'user', content: 'hi' }], {
+    tools: [{ type: 'function', function: { name: 'write_file', description: 'Write', parameters: {} } }],
+    tool_choice: 'none',
+  });
+
+  assert.equal(res.status, 200, res.text);
+  assert.equal(res.json.choices[0].message.tool_calls, undefined);
+  const completions = byPath(calls, COMPLETION, 'A');
+  assert.ok(completions[0].body.prompt.includes(NO_TOOLS_MARKER));
+});
+
+test('HTTP: normal tools mode still advertises tools unchanged', async (t) => {
+  const A = acct('A');
+  useAccounts(t, [A]);
+  const calls = installUpstream(t, { completion: { A: [() => sse(okSse('tool ok'))] } });
+  seedStickyWithFingerprint(t, 'tools-normal', 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, 'tools-normal', [{ role: 'user', content: 'write file' }], {
+    tools: [{ type: 'function', function: { name: 'write_file', description: 'Write', parameters: {} } }],
+  });
+
+  assert.equal(res.status, 200, res.text);
+  const completions = byPath(calls, COMPLETION, 'A');
+  assert.ok(completions[0].body.prompt.includes('write_file') || completions[0].body.prompt.includes('Available tools'),
+    'normal tools mode must advertise tools');
+});
+
+test('HTTP: unexpected tool JSON in no-tools mode repairs to 200 not 502', async (t) => {
+  const A = acct('A');
+  useAccounts(t, [A]);
+  const toolJson = '{"tool_call":{"name":"write_file","arguments":{"path":"x","content":"y"}}}';
+  installUpstream(t, {
+    completion: { A: [
+      () => sse(okSse(toolJson)),
+      () => sse(okSse('compliant plain')),
+    ]},
+  });
+  seedStickyWithFingerprint(t, 'nt-repair', 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, 'nt-repair', [{ role: 'user', content: 'hello' }]);
+
+  assert.equal(res.status, 200, `must be 200 not 502. Body: ${res.text}`);
+  assert.equal(res.json.choices[0].message.content, 'compliant plain');
+});
+
+test('HTTP: missing tool_choice + zero schemas is no-tools mode', async (t) => {
+  const A = acct('A');
+  useAccounts(t, [A]);
+  const calls = installUpstream(t, { completion: { A: [() => sse(okSse('plain'))] } });
+  seedStickyWithFingerprint(t, 'nt-guard-missing', 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, 'nt-guard-missing', [{ role: 'user', content: 'hi' }]);
+
+  assert.equal(res.status, 200, res.text);
+  const completions = byPath(calls, COMPLETION, 'A');
+  assert.ok(completions[0].body.prompt.includes(NO_TOOLS_MARKER));
+});
+
+test('HTTP: stream mode no-tools still carries contract', async (t) => {
+  const A = acct('A');
+  useAccounts(t, [A]);
+  const calls = installUpstream(t, { completion: { A: [() => sse(okSse('streamed plain'))] } });
+  seedStickyWithFingerprint(t, 'nt-stream', 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, 'nt-stream', [{ role: 'user', content: 'hi' }], { stream: true });
+
+  assert.equal(res.status, 200, res.text);
+  const completions = byPath(calls, COMPLETION, 'A');
+  assert.ok(completions[0].body.prompt.includes(NO_TOOLS_MARKER));
+});

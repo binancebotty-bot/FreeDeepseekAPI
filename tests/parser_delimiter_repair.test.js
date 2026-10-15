@@ -17,11 +17,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const S = require('../server.js').__test;
-// On the unmodified parser the helper does not exist. The fail-closed guards must still
-// hold there, so an absent helper is treated as "repairs nothing" rather than an error.
-const repair = typeof S.repairTruncatedJsonEnvelope === 'function'
-  ? S.repairTruncatedJsonEnvelope
-  : () => null;
+assert.equal(typeof S.repairTruncatedJsonEnvelope, 'function', 'server.js must export repairTruncatedJsonEnvelope');
+const repair = S.repairTruncatedJsonEnvelope;
 const TOOLS = new Set(['write_file', 'read_file', 'terminal']);
 
 const FIXTURE = path.join(__dirname, 'fixtures', 'deepseek_real_capture_9699_fullcontent.json');

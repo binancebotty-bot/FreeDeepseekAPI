@@ -208,7 +208,7 @@ Response:
   "api": "openai",                   // openai | anthropic | responses
   "model": "deepseek-v4-flash-thinking",  // requested model (canonical), null if the body did not parse
   "account": "work-main",            // serving account; null when rejected before routing or answered locally
-  "agent": "dashboard:9f2c…",        // x-agent-session | session | user | 'dev-agent' (loopback) | remote IP
+  "agent": "dashboard:9f2c…",        // x-agent-session | session | user | 'unkeyed-<hash>' (remote address + User-Agent)
   "ip": "127.0.0.1",
   "status": 200,                     // 499 = client disconnected
   "ok": true,
