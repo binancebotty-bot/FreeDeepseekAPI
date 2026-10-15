@@ -1477,6 +1477,64 @@ test('second strict repair recovers a malformed first repair without exposing a 
   assert.equal(byPath(calls, COMPLETION, 'A').length, 3, 'one original call plus two bounded repair attempts');
 });
 
+test('fresh-session rotation recovers repeated malformed repairs before client retry/fallback', async (t) => {
+  const A = acct('A');
+  const B = acct('B');
+  useAccounts(t, [A, B]);
+  const calls = installUpstream(t, {
+    completion: {
+      A: [
+        () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+        () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+        () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+      ],
+      B: [() => sse(okSse(VALID_TOOL_CALL))],
+    },
+  });
+  const agent = 'repair-rotation-fresh-session-after-malformed';
+  seedStickySession(t, agent, 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await chat(port, agent, HISTORY_MESSAGES, { tools: TOOL_SCHEMA });
+
+  assert.equal(res.status, 200, `fresh-session recovery should prevent a client-level retry/fallback, got ${res.status}: ${res.text.slice(0, 300)}`);
+  assert.equal(res.json?.choices?.[0]?.message?.tool_calls?.[0]?.function?.name, 'read_file');
+  assert.equal(byPath(calls, COMPLETION, 'A').length, 3, 'A gets original plus two bounded same-account format repairs');
+  assert.equal(byPath(calls, COMPLETION, 'B').length, 1, 'a ready alternate login gets one clean-context recovery call');
+  assertRepairContext(repairPayloadText(calls, 'B'), 'fresh-session B recovery payload');
+  assert.equal(byPath(calls, SESSION_CREATE, 'B').length, 1, 'B must own a newly-created remote chat');
+  assert.notEqual(byPath(calls, COMPLETION, 'B')[0].body.chat_session_id, 'old-A', 'the malformed A chat must not be reused');
+});
+
+test('fresh-session recovery respects an explicitly pinned account', async (t) => {
+  const A = acct('A');
+  const B = acct('B');
+  useAccounts(t, [A, B]);
+  const calls = installUpstream(t, {
+    completion: {
+      A: [
+        () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+        () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+        () => sse(okSse(MALFORMED_TOOL_ENVELOPE)),
+        () => sse(okSse(VALID_TOOL_CALL)),
+      ],
+      B: [() => sse(okSse(VALID_TOOL_CALL))],
+    },
+  });
+  const agent = 'repair-rotation-fresh-session-pinned';
+  seedStickySession(t, agent, 'A', 'old-A');
+  const port = await startServer(t);
+
+  const res = await request(port, 'POST', '/v1/chat/completions', {
+    body: { model: 'deepseek-v4-flash', messages: HISTORY_MESSAGES, tools: TOOL_SCHEMA },
+    headers: { 'x-agent-session': agent, 'x-account-id': 'A' },
+  });
+
+  assert.equal(res.status, 200, `pinned fresh-session recovery should succeed, got ${res.status}: ${res.text.slice(0, 300)}`);
+  assert.equal(byPath(calls, COMPLETION, 'A').length, 4, 'the pinned login gets one fresh-context recovery call');
+  assert.equal(byPath(calls, COMPLETION, 'B').length, 0, 'explicit account pin must never be bypassed');
+});
+
 test('unchanged normal successful repair still works on the sticky account', async (t) => {
   const A = acct('A');
   useAccounts(t, [A]);

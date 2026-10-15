@@ -4987,6 +4987,44 @@ const server = http.createServer(async (req, res) => {
                     repairUnavailable = Boolean(repairRateLimitError);
                     console.log(`${agentTag} strict repair was not completed after ${repairAttempts} attempt(s): ${repairRateLimitError?.message || 'no ready login'}.`);
                 }
+                if (!shouldRepairNoTools && !repairUnavailable && retryResult2 && !repairCandidateIsUsable(retryResult2) && !clientGone && !deadlineHit()) {
+                    const previousAccountId = session.accountId;
+                    const previousPin = lockHolder.pinnedAccountId;
+                    const alternate = previousPin ? null : accounts
+                        .filter(account => account.id !== previousAccountId && accountCanServe(account, Date.now()) && !isLockedByOther(account, lockHolder))
+                        .sort((a, b) => (a.lastUsedAt || 0) - (b.lastUsedAt || 0) || a.id.localeCompare(b.id))[0];
+                    const recoveryAccountId = alternate?.id || previousPin || previousAccountId || 'pool';
+                    console.log(`${agentTag} Repeated malformed tool output; discarding the upstream chat and retrying with a fresh full-context request on ${recoveryAccountId}.`);
+                    resetRemoteSession(session);
+                    session.accountId = alternate ? null : (previousPin || previousAccountId || null);
+                    releaseAccountChatLock(lockHolder);
+                    if (imageContext?.refFileIds) imageContext.refFileIds.length = 0;
+                    if (alternate) lockHolder.pinnedAccountId = alternate.id;
+                    const freshRepairPrompt = appendPromptInstruction(
+                        repairRecoveryPrompt,
+                        '[STRICT INSTRUCTION] The prior chat returned malformed tool output twice. This is a fresh chat with the full task and tool schema. Return exactly one valid JSON tool_call for an advertised tool, preserving every argument value.'
+                    );
+                    repairAttempts++;
+                    try {
+                        const freshRepairCall = await askDeepSeekStream(
+                            freshRepairPrompt, agentId, requestedModel, freshRepairPrompt, lockHolder, imageContext, webFlags
+                        );
+                        const freshRepairRead = await readDeepSeekResponse(freshRepairCall.resp.body, freshRepairCall.account);
+                        if (freshRepairRead.rateLimited) {
+                            repairRateLimitError = freshRepairRead.rateLimitError || repairRateLimitError;
+                            repairUnavailable = Boolean(repairRateLimitError);
+                        } else {
+                            retryResult2 = freshRepairRead;
+                        }
+                    } catch (e) {
+                        if (!isRateLimitedPoolOrAccount(e)) throw e;
+                        repairRateLimitError = e;
+                        repairUnavailable = true;
+                    } finally {
+                        if (previousPin) lockHolder.pinnedAccountId = previousPin;
+                        else delete lockHolder.pinnedAccountId;
+                    }
+                }
                 const retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
                 if (retryContent2 && retryContent2.trim()) {
                     if (shouldRepairNoTools) {
